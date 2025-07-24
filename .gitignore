@@ -50,3 +50,5 @@ forwarder.db
 # OS specific
 .DS_Store
 Thumbs.db
+
+bot_config.json
