@@ -236,6 +236,16 @@ class RunningState(BotState):
                             logger.info(f"📌 Запись о закрепленном сообщении {pinned_message_id} удалена (сообщение не найдено)")
                         else:
                             logger.error(f"❌ Не удалось открепить сообщение {pinned_message_id} в чате {chat_id}: {e}")
+
+                # Дополнительная очистка — снимаем все закрепы, чтобы исключить висящие сообщения
+                try:
+                    await self.context.bot.unpin_all_chat_messages(chat_id)
+                except Exception as e:
+                    error_text = str(e).lower()
+                    if "not enough rights" in error_text or "chat not found" in error_text:
+                        logger.debug(f"Не удалось выполнить unpin_all для чата {chat_id}: {e}")
+                    else:
+                        logger.warning(f"Предупреждение при unpin_all в чате {chat_id}: {e}")
             
             if unpinned_count > 0:
                 logger.info(f"🧹 Откреплено {unpinned_count} сообщений во всех чатах")

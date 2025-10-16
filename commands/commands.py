@@ -3,22 +3,22 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from loguru import logger
 from .base_command import Command
 from database.repository import Repository
-from utils.keyboard_factory import KeyboardFactory
 from utils.bot_state import IdleState, RunningState
 from utils.config import Config
 
 
 class StartCommand(Command):
-    def __init__(self, running: bool = False):
+    def __init__(self, bot_instance):
         super().__init__()
-        self.running = running
+        self.bot_instance = bot_instance
 
     async def _handle(self, message: types.Message) -> None:
+        running = isinstance(self.bot_instance.context.state, RunningState)
         await message.answer(
             "Добро пожаловать в бот для пересылки сообщений из каналов!\n"
             "Используйте кнопки ниже для управления ботом:\n\n"
             "Введите /help для просмотра доступных команд.",
-            reply_markup=KeyboardFactory.create_main_keyboard(self.running)
+            reply_markup=self.bot_instance.get_main_keyboard(running)
         )
 
 class HelpCommand(Command):

@@ -5,9 +5,11 @@ import json
 import shutil
 import sys
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any, Set
+from typing import Optional, List, Dict, Any, Set, Tuple
 import multiprocessing
 from multiprocessing import Process
+import uuid
+from pathlib import Path
 
 from loguru import logger
 from aiogram import Bot, Dispatcher, types
@@ -58,10 +60,10 @@ class BotManager:
             'started_at': datetime.now().isoformat()
         }
         self.processes[bot_id] = process
-        
+
         logger.info(f"Added bot {bot_id} to manager. Total bots: {len(self.bots)}")
         logger.debug(f"Current bots: {list(self.bots.keys())}")
-    
+
     def remove_bot(self, bot_id: str):
         """Remove a bot from the manager"""
         if bot_id in self.processes:
@@ -70,63 +72,59 @@ class BotManager:
                 process.terminate()
                 process.join(timeout=5)
             del self.processes[bot_id]
-            del self.bots[bot_id]
-    
+            if bot_id in self.bots:
+                del self.bots[bot_id]
+
     def get_bot_status(self, bot_id: str):
         """Get status of a specific bot"""
         return self.bots.get(bot_id, None)
-    
+
     def list_bots(self):
         """List all managed bots"""
         logger.debug(f"Listing bots. Total: {len(self.bots)}, Keys: {list(self.bots.keys())}")
         return dict(self.bots)
-def run_bot_process(bot_token: str, owner_id: int, source_channels: list, bot_id: str):
+
+
+def run_bot_process(bot_token: str, owner_id: int, bot_id: str, clone_env: Optional[Dict[str, str]] = None):
     """Wrapper to run bot in a separate process"""
-    # Set up logging for the subprocess
     logger.add(f"bot_{bot_id}.log", rotation="10 MB")
-    
-    # Create new event loop for this process
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    
+
     try:
-        loop.run_until_complete(run_bot_instance(bot_token, owner_id, source_channels, bot_id))
+        loop.run_until_complete(run_bot_instance(bot_token, owner_id, bot_id, clone_env))
     except Exception as e:
         logger.error(f"Error in bot process {bot_id}: {e}")
     finally:
         loop.close()
 
-# Function to run a bot instance 
-async def run_bot_instance(bot_token: str, owner_id: int, source_channels: list, bot_id: str):
+
+async def run_bot_instance(bot_token: str, owner_id: int, bot_id: str, clone_env: Optional[Dict[str, str]] = None):
     """Run a bot instance with specific configuration"""
-    import os
-    import sys
-    
-    # Create a temporary config for this bot instance
     os.environ['BOT_TOKEN'] = bot_token
     os.environ['OWNER_ID'] = str(owner_id)
-    
-    # Create a custom config class for this instance
+    if clone_env:
+        for key, value in clone_env.items():
+            if value is not None:
+                os.environ[str(key)] = str(value)
+
     from utils.config import Config
-    
-    # Override the singleton pattern for this process
+
     Config._instance = None
     config = Config()
     config.bot_token = bot_token
     config.owner_id = owner_id
-    config.source_channels = source_channels
-    
-    # Create a new bot instance
+
     from bot import ForwarderBot  # Adjust import as needed for zakrepbot
     bot_instance = ForwarderBot()
     bot_instance.bot_id = bot_id  # Add identifier
-    
+
     try:
         await bot_instance.start()
     except Exception as e:
         logger.error(f"Bot {bot_id} crashed: {e}")
         raise
-
 
 
 class ForwarderBot(CacheObserver):
@@ -141,7 +139,9 @@ class ForwarderBot(CacheObserver):
         self.awaiting_channel_input = None  # Отслеживание ввода канала
         self.awaiting_interval_input = None  # Отслеживание ввода интервала
         self.bot_manager = BotManager()
-        self.bot_id = "main"  # Identifier for the main bot
+        self.is_clone = os.getenv("IS_CLONE", "0") == "1"
+        self.bot_id = os.getenv("CLONE_ID", "main") if self.is_clone else "main"
+        self.secret_command = os.getenv("CLONE_SECRET_COMMAND")
         self.child_bots = []  # Track spawned bots
         self.awaiting_clone_token = None  # Track if waiting for clone token
         # Словарь для хранения ID закрепленных сообщений в чатах
@@ -151,12 +151,229 @@ class ForwarderBot(CacheObserver):
         self.temp_schedule_data = {}
         # Add this line to create the keyboard factory
         self.keyboard_factory = KeyboardFactory()
+        self.clone_registry_path = Path(os.getenv("CLONE_REGISTRY_PATH", "clone_registry.json")).resolve()
+        self.clone_data_base = Path(os.getenv("CLONES_BASE_DIR", Path(__file__).resolve().parent / "clones_data")).resolve()
+        self.clone_data_base.mkdir(parents=True, exist_ok=True)
+        self.clone_registry: Dict[str, Dict[str, Any]] = {}
+        self.pending_clone_batches: Dict[str, Dict[str, Any]] = {}
+        self.clone_secret_commands: Dict[str, str] = {}
+        if not self.is_clone:
+            self._load_clone_registry()
+        elif self.secret_command:
+            logger.info(f"Клон запущен с секретной командой: {self.secret_command}")
         
         # Регистрируем себя как наблюдатель кэша
         self.cache_service.add_observer(self)
         
         # Настраиваем обработчики
         self._setup_handlers()
+
+    def _load_clone_registry(self) -> None:
+        if self.is_clone:
+            return
+
+        try:
+            if self.clone_registry_path.exists():
+                with open(self.clone_registry_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        self.clone_registry = data
+                        for bot_id, info in data.items():
+                            secret = info.get('secret_command')
+                            if secret:
+                                self.clone_secret_commands[bot_id] = secret
+        except Exception as e:
+            logger.error(f"Не удалось загрузить реестр клонов: {e}")
+            self.clone_registry = {}
+            self.clone_secret_commands = {}
+
+    def _save_clone_registry(self) -> None:
+        if self.is_clone:
+            return
+
+        try:
+            os.makedirs(self.clone_registry_path.parent, exist_ok=True)
+            with open(self.clone_registry_path, 'w', encoding='utf-8') as f:
+                json.dump(self.clone_registry, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"Не удалось сохранить реестр клонов: {e}")
+
+    def _register_clone(self, bot_id: str, info: Dict[str, Any]) -> None:
+        if self.is_clone:
+            return
+
+        existing = self.clone_registry.get(bot_id, {})
+        sanitized_info = dict(info)
+        username = sanitized_info.get('username')
+        if username and not str(username).startswith('@'):
+            sanitized_info['username'] = f"@{username}"
+
+        merged = {**existing, **sanitized_info}
+        merged['updated_at'] = datetime.now().isoformat()
+        self.clone_registry[bot_id] = merged
+        secret = sanitized_info.get('secret_command') or info.get('secret_command')
+        if secret:
+            self.clone_secret_commands[bot_id] = secret
+        self._save_clone_registry()
+
+    def _generate_secret_command(self, bot_username: str, reserved: Optional[Set[str]] = None) -> str:
+        base = ''.join(ch.lower() for ch in bot_username if ch.isalnum()) or 'clone'
+        existing = {cmd.lower() for cmd in self.clone_secret_commands.values()}
+        if reserved:
+            existing |= {cmd.lower() for cmd in reserved}
+        while True:
+            suffix = uuid.uuid4().hex[:6]
+            command = f"/admin_{base}_{suffix}"
+            if command.lower() not in existing:
+                return command
+
+    def get_main_keyboard(self, running: bool) -> Any:
+        return KeyboardFactory.create_main_keyboard(running, is_clone=self.is_clone)
+
+    async def _resolve_chat_name(self, chat: Optional[types.Chat], chat_id: int) -> str:
+        candidates = []
+        if chat:
+            candidates.extend([
+                getattr(chat, 'title', None),
+                getattr(chat, 'full_name', None),
+            ])
+            username = getattr(chat, 'username', None)
+            if username:
+                candidates.append(f"@{username}")
+
+        for candidate in candidates:
+            if candidate:
+                return candidate
+
+        metadata = await Repository.get_chat_metadata(chat_id)
+        if metadata:
+            title = metadata.get('title')
+            if title:
+                return title
+            username = metadata.get('username')
+            if username:
+                return f"@{username}"
+
+        return f"Чат {chat_id}"
+
+    def _matches_secret_command(self, text: Optional[str]) -> bool:
+        if not self.secret_command or not text:
+            return False
+        trigger = self.secret_command.lower()
+        candidate = text.strip().split()[0].lower()
+        if '@' in candidate:
+            candidate = candidate.split('@')[0]
+        return candidate == trigger
+
+    async def handle_secret_command(self, message: types.Message) -> None:
+        if not self.secret_command:
+            return
+
+        user_id = message.from_user.id
+        if self.config.is_admin(user_id):
+            await message.reply("✅ Вы уже являетесь администратором этого бота.")
+            return
+
+        if self.config.add_admin(user_id):
+            full_name = message.from_user.full_name or message.from_user.username or str(user_id)
+            await message.reply(
+                "🎉 Вы получили права администратора для этого клона."
+            )
+            try:
+                await self._notify_admins(
+                    f"🔐 Пользователь {full_name} ({user_id}) получил права администратора через секретную команду."
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось уведомить администраторов о новом администраторе: {e}")
+        else:
+            await message.reply(
+                "⚠️ Не удалось добавить вас в список администраторов. Обратитесь к владельцу бота."
+            )
+
+    def _parse_token_input(self, raw_text: str) -> List[str]:
+        separators = [',', ';', '\n', '\t']
+        for sep in separators:
+            raw_text = raw_text.replace(sep, ' ')
+
+        tokens: List[str] = []
+        for chunk in raw_text.split():
+            candidate = chunk.strip()
+            if not candidate or ':' not in candidate:
+                continue
+            if candidate not in tokens:
+                tokens.append(candidate)
+        return tokens
+
+    def _ensure_clone_storage(self, bot_id: str) -> Tuple[Path, Path, Path]:
+        clone_dir = self.clone_data_base / bot_id
+        os.makedirs(clone_dir, exist_ok=True)
+
+        config_source = Path(self.config.config_path)
+        config_target = clone_dir / 'bot_config.json'
+        if config_source.exists() and not config_target.exists():
+            shutil.copy2(config_source, config_target)
+
+        db_source = Path(self.config.db_path)
+        db_target = clone_dir / 'forwarder.db'
+        if db_source.exists() and not db_target.exists():
+            shutil.copy2(db_source, db_target)
+
+        return clone_dir, config_target, db_target
+
+    def _build_clone_env(self, bot_id: str, secret_command: str, config_path: Path, db_path: Path) -> Dict[str, str]:
+        env = {
+            "IS_CLONE": "1",
+            "CLONE_ID": bot_id,
+            "CLONE_SECRET_COMMAND": secret_command,
+            "BOT_CONFIG_PATH": str(config_path),
+            "DB_PATH": str(db_path),
+            "ADMIN_IDS": ','.join(map(str, self.config.admin_ids)),
+            "OWNER_ID": str(self.config.owner_id),
+            "CLONE_REGISTRY_PATH": str(self.clone_registry_path),
+            "CLONES_BASE_DIR": str(self.clone_data_base),
+        }
+        return env
+
+    async def _validate_token(self, token: str) -> Optional[types.User]:
+        try:
+            test_bot = Bot(token=token)
+            bot_info = await test_bot.get_me()
+            await test_bot.session.close()
+            return bot_info
+        except Exception as e:
+            logger.error(f"Не удалось проверить токен: {e}")
+            return None
+
+    async def _start_inline_clone_item(self, item: Dict[str, Any]) -> Tuple[bool, str]:
+        bot_id = item['bot_id']
+        token = item['token']
+        secret_command = item['secret_command']
+        username = item['username']
+
+        clone_dir, config_path, db_path = self._ensure_clone_storage(bot_id)
+        env = self._build_clone_env(bot_id, secret_command, config_path, db_path)
+
+        process = Process(
+            target=run_bot_process,
+            args=(token, self.config.owner_id, bot_id, env),
+            name=bot_id
+        )
+
+        process.start()
+        self.bot_manager.add_bot(bot_id, process)
+        self.child_bots.append(bot_id)
+        self.clone_secret_commands[bot_id] = secret_command
+        self._register_clone(
+            bot_id,
+            {
+                "secret_command": secret_command,
+                "data_dir": str(clone_dir),
+                "username": username,
+                "mode": "inline",
+            }
+        )
+
+        return True, f"✅ Бот @{username} запущен (PID: {process.pid})"
     # Let's also add the overwrite_clone method that was referenced earlier
     async def add_schedule_prompt(self, callback: types.CallbackQuery):
         if not self.is_admin(callback.from_user.id):
@@ -339,7 +556,13 @@ class ForwarderBot(CacheObserver):
             return 0 <= hours < 24 and 0 <= minutes < 60
         except ValueError:
             return False
-    async def _perform_bot_clone(self, new_token: str, clone_dir: str, progress_msg=None):
+    async def _perform_bot_clone(
+        self,
+        new_token: str,
+        clone_dir: str,
+        progress_msg=None,
+        secret_command: Optional[str] = None
+    ):
         """Perform the actual bot cloning"""
         try:
             # Get bot info for the new token
@@ -378,18 +601,22 @@ class ForwarderBot(CacheObserver):
             
             # Create new .env file with new token - ИСПРАВЛЕНО
             env_content = f"""# Telegram Bot Token from @BotFather
-    BOT_TOKEN={new_token}
+BOT_TOKEN={new_token}
 
-    # Your Telegram user ID (get from @userinfobot)
-    OWNER_ID={self.config.owner_id}
+# Your Telegram user ID (get from @userinfobot)
+OWNER_ID={self.config.owner_id}
 
-    # Admin IDs (comma separated for multiple admins)
-    ADMIN_IDS={','.join(map(str, self.config.admin_ids))}
+# Admin IDs (comma separated for multiple admins)
+ADMIN_IDS={','.join(map(str, self.config.admin_ids))}
 
-    # Source channel username or ID (bot must be admin)
-    # Can be either numeric ID (-100...) or channel username without @
-    SOURCE_CHANNEL={self.config.source_channels[0] if self.config.source_channels else ''}
-    """
+# Source channel username or ID (bot must be admin)
+# Can be either numeric ID (-100...) or channel username without @
+SOURCE_CHANNEL={self.config.source_channels[0] if self.config.source_channels else ''}
+
+# Clone specific
+IS_CLONE=1
+CLONE_SECRET_COMMAND={secret_command or ''}
+"""
             
             with open(os.path.join(clone_path, '.env'), 'w') as f:
                 f.write(env_content)
@@ -457,6 +684,7 @@ class ForwarderBot(CacheObserver):
     - The bot will forward messages to the same target chats as the main bot
     - Database is separate from the main bot
     - All configured admins can manage this bot clone
+    - Secret admin command: {secret_command or 'будет установлен при запуске'}
     """
             
             with open(os.path.join(clone_path, 'README.md'), 'w') as f:
@@ -473,12 +701,14 @@ class ForwarderBot(CacheObserver):
                     f"Для запуска клона:\n"
                     f"1. Перейдите в папку: {clone_path}\n"
                     f"2. Запустите: `python bot.py` или используйте скрипт start_bot.sh (Linux) / start_bot.bat (Windows)\n\n"
-                    f"Клон будет работать независимо с теми же настройками каналов и администраторами."
+                    f"Клон будет работать независимо с теми же настройками каналов и администраторами.\n"
+                    f"🔐 Секретную команду можно посмотреть в разделе \"Управление клонами\" основного бота."
                 )
                 
                 await progress_msg.edit_text(success_text, reply_markup=kb.as_markup())
             
             logger.info(f"Successfully cloned bot to {clone_dir}")
+            return clone_path
             
         except Exception as e:
             logger.error(f"Error during bot clone: {e}")
@@ -496,6 +726,10 @@ class ForwarderBot(CacheObserver):
         """Create clone files for separate deployment"""
         # БЫЛО: if callback.from_user.id != self.config.owner_id:
         if not self.is_admin(callback.from_user.id):  # ИСПРАВЛЕНО
+            return
+
+        if self.is_clone:
+            await callback.answer("Функция недоступна в клон-боте", show_alert=True)
             return
         
         # Parse data: clone_files_token
@@ -516,6 +750,9 @@ class ForwarderBot(CacheObserver):
             
             # Create clone directory name
             clone_dir = f"bot_clone_{bot_info.username}"
+            bot_id = f"bot_{bot_info.username}"
+            base_name = bot_info.username or str(bot_info.id)
+            secret = self.clone_secret_commands.get(bot_id) or self._generate_secret_command(base_name)
             
             # Check if clone already exists
             current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -536,7 +773,16 @@ class ForwarderBot(CacheObserver):
                 return
             
             # Create clone files
-            await self._perform_bot_clone(new_token, clone_dir, progress_msg)
+            result_path = await self._perform_bot_clone(new_token, clone_dir, progress_msg, secret_command=secret)
+            self._register_clone(
+                bot_id,
+                {
+                    "secret_command": secret,
+                    "data_dir": str(result_path),
+                    "username": bot_info.username or str(bot_info.id),
+                    "mode": "standalone",
+                }
+            )
             
         except Exception as e:
             kb = InlineKeyboardBuilder()
@@ -554,6 +800,10 @@ class ForwarderBot(CacheObserver):
         """Run cloned bot in the same solution"""
         # БЫЛО: if callback.from_user.id != self.config.owner_id:
         if not self.is_admin(callback.from_user.id):  # ИСПРАВЛЕНО
+            return
+
+        if self.is_clone:
+            await callback.answer("Функция недоступна в клон-боте", show_alert=True)
             return
         
         # Parse data: clone_inline_token
@@ -573,6 +823,7 @@ class ForwarderBot(CacheObserver):
             await test_bot.session.close()
             
             bot_id = f"bot_{bot_info.username}"
+            username = bot_info.username or str(bot_info.id)
             
             # Check if this bot is already running
             if hasattr(self, 'bot_manager') and bot_id in self.bot_manager.processes:
@@ -597,16 +848,15 @@ class ForwarderBot(CacheObserver):
             if not hasattr(self, 'child_bots'):
                 self.child_bots = []
             
-            # Create a new process for the bot
-            process = Process(
-                target=run_bot_process,
-                args=(new_token, self.config.owner_id, self.config.source_channels, bot_id),
-                name=bot_id
+            secret = self.clone_secret_commands.get(bot_id) or self._generate_secret_command(username)
+            success, text = await self._start_inline_clone_item(
+                {
+                    "token": new_token,
+                    "username": username,
+                    "bot_id": bot_id,
+                    "secret_command": secret,
+                }
             )
-            
-            process.start()
-            self.bot_manager.add_bot(bot_id, process)
-            self.child_bots.append(bot_id)
             
             kb = InlineKeyboardBuilder()
             kb.button(text="Управление клонами", callback_data="manage_clones")
@@ -614,10 +864,7 @@ class ForwarderBot(CacheObserver):
             kb.adjust(2)
             
             await callback.message.edit_text(
-                f"✅ Бот @{bot_info.username} успешно запущен!\n\n"
-                f"ID процесса: {process.pid}\n"
-                f"Статус: Работает\n\n"
-                "Бот работает в отдельном процессе и будет пересылать сообщения.",
+                f"{text}\n🔐 Секретная команда доступна в разделе \"Управление клонами\".\n\nБот работает в отдельном процессе и будет пересылать сообщения.",
                 reply_markup=kb.as_markup()
             )
             
@@ -637,61 +884,63 @@ class ForwarderBot(CacheObserver):
         # БЫЛО: if callback.from_user.id != self.config.owner_id:
         if not self.is_admin(callback.from_user.id):  # ИСПРАВЛЕНО
             return
+
+        if self.is_clone:
+            await callback.answer("Функция недоступна в клон-боте", show_alert=True)
+            return
         
         # Ensure bot_manager exists
         if not hasattr(self, 'bot_manager'):
             self.bot_manager = BotManager()
             
         bots = self.bot_manager.list_bots()
-        
-        # Count clones (excluding main bot)
-        clone_count = len([b for b in bots if b != "main"])
-        
-        if clone_count == 0:
-            kb = InlineKeyboardBuilder()
-            kb.button(text="Добавить клон", callback_data="clone_bot")
-            kb.button(text="Назад", callback_data="back_to_main")
-            kb.adjust(2)
-            
-            await callback.message.edit_text(
-                "📋 Нет запущенных клонов.\n\n"
-                "Добавьте новый клон для управления несколькими ботами.",
-                reply_markup=kb.as_markup()
-            )
+
+        registry_snapshot = dict(self.clone_registry)
+        combined_ids = set(registry_snapshot.keys()) | {bot_id for bot_id in bots.keys() if bot_id != "main"}
+
+        kb = InlineKeyboardBuilder()
+        text_lines = ["🤖 Управление клонами\n"]
+
+        main_info = bots.get("main", {})
+        text_lines.append(f"• Основной бот\n  Статус: 🟢 Работает\n  PID: {main_info.get('pid', 'N/A')}\n")
+
+        if not combined_ids:
+            text_lines.append("\n📋 Нет известных клонов. Добавьте нового через 'Клонировать бота'.")
         else:
-            text = "🤖 Запущенные боты:\n\n"
-            kb = InlineKeyboardBuilder()
-            
-            # Show main bot info first
-            main_info = bots.get("main", {})
-            text += f"• Основной бот\n  Статус: 🟢 Работает\n  PID: {main_info.get('pid', 'N/A')}\n\n"
-            
-            # Show clones
-            for bot_id, info in bots.items():
-                if bot_id == "main":
-                    continue
-                    
-                # Check if process is alive
-                process = self.bot_manager.processes.get(bot_id)
-                if process and process.is_alive():
-                    status = "🟢 Работает"
-                else:
-                    status = "🔴 Остановлен"
-                
-                # Extract bot username from bot_id
-                bot_username = bot_id.replace("bot_", "@")
-                text += f"• {bot_username}\n  Статус: {status}\n  PID: {info.get('pid', 'N/A')}\n  Запущен: {info.get('started_at', 'Неизвестно')}\n\n"
-                
-                if status == "🟢 Работает":
-                    kb.button(text=f"Остановить {bot_username}", callback_data=f"stop_clone_{bot_id}")
-                else:
-                    kb.button(text=f"Запустить {bot_username}", callback_data=f"start_clone_{bot_id}")
-            
-            kb.button(text="Добавить клон", callback_data="clone_bot")
-            kb.button(text="Назад", callback_data="back_to_main")
-            kb.adjust(1)
-            
-            await callback.message.edit_text(text, reply_markup=kb.as_markup())
+            text_lines.append("\n👥 Клоны:")
+
+        for bot_id in sorted(combined_ids):
+            process = self.bot_manager.processes.get(bot_id)
+            is_running = process.is_alive() if process else False
+            status_icon = "🟢" if is_running else "🔴"
+            info = bots.get(bot_id, {})
+            registry_info = registry_snapshot.get(bot_id, {})
+            username = registry_info.get('username') or bot_id.replace("bot_", "@")
+            secret = registry_info.get('secret_command') or self.clone_secret_commands.get(bot_id, '—')
+            mode = registry_info.get('mode', 'inline')
+            data_dir = registry_info.get('data_dir')
+
+            text_lines.append(
+                f"\n• {username}\n  Статус: {status_icon} {'Работает' if is_running else 'Не запущен в этом процессе'}"
+            )
+            if is_running:
+                text_lines.append(f"  PID: {info.get('pid', 'N/A')}")
+                text_lines.append(f"  Запущен: {info.get('started_at', 'Неизвестно')}")
+            if secret and secret != '—':
+                text_lines.append(f"  Секретная команда: {secret}")
+            if data_dir:
+                text_lines.append(f"  Папка: {data_dir}")
+            mode_label = "встроенный" if mode == "inline" else "отдельный"
+            text_lines.append(f"  Режим: {mode_label}")
+
+            if is_running:
+                kb.button(text=f"Остановить {username}", callback_data=f"stop_clone_{bot_id}")
+
+        kb.button(text="Добавить клон", callback_data="clone_bot")
+        kb.button(text="Назад", callback_data="back_to_main")
+        kb.adjust(1)
+
+        await callback.message.edit_text("\n".join(text_lines), reply_markup=kb.as_markup())
         
         await callback.answer()
 
@@ -699,6 +948,10 @@ class ForwarderBot(CacheObserver):
         """Stop a running bot clone"""
         # БЫЛО: if callback.from_user.id != self.config.owner_id:
         if not self.is_admin(callback.from_user.id):  # ИСПРАВЛЕНО
+            return
+
+        if self.is_clone:
+            await callback.answer("Функция недоступна в клон-боте", show_alert=True)
             return
         
         bot_id = callback.data.replace("stop_clone_", "")
@@ -721,39 +974,199 @@ class ForwarderBot(CacheObserver):
         # БЫЛО: if message.from_user.id != self.config.owner_id:
         if not self.is_admin(message.from_user.id):  # ИСПРАВЛЕНО
             return
+
+        if self.is_clone:
+            await message.reply("Функция недоступна в клон-боте")
+            return
         
         if not hasattr(self, 'awaiting_clone_token') or self.awaiting_clone_token != message.from_user.id:
             return
         
-        new_token = message.text.strip()
-        
-        if not new_token or ':' not in new_token:
-            await message.reply("⚠️ Неверный формат токена.")
-            return
-        
+        tokens = self._parse_token_input(message.text or "")
         self.awaiting_clone_token = None
-        
-        # Verify the token
-        try:
-            test_bot = Bot(token=new_token)
-            bot_info = await test_bot.get_me()
-            await test_bot.session.close()
-            
-            kb = InlineKeyboardBuilder()
-            kb.button(text="🚀 Запустить сейчас", callback_data=f"clone_inline_{new_token}")
-            kb.button(text="💾 Создать файлы", callback_data=f"clone_files_{new_token}")
-            kb.button(text="Отмена", callback_data="back_to_main")
-            kb.adjust(2)
-            
-            await message.reply(
-                f"✅ Токен проверен!\n"
-                f"Бот: @{bot_info.username}\n\n"
-                "Выберите действие:",
-                reply_markup=kb.as_markup()
+
+        if not tokens:
+            await message.reply("⚠️ Не удалось найти токены в сообщении. Укажите хотя бы один токен формата 123456:ABC.")
+            return
+
+        successes: List[Dict[str, Any]] = []
+        failures: List[str] = []
+        reserved_commands: Set[str] = set()
+
+        for token in tokens:
+            bot_info = await self._validate_token(token)
+            if not bot_info:
+                failures.append(token)
+                continue
+
+            username = bot_info.username or str(bot_info.id)
+            bot_id = f"bot_{username}"
+            existing_secret = self.clone_secret_commands.get(bot_id)
+            if existing_secret:
+                secret = existing_secret
+                reserved_commands.add(secret)
+            else:
+                secret = self._generate_secret_command(username, reserved=reserved_commands)
+                reserved_commands.add(secret)
+            successes.append({
+                "token": token,
+                "username": username,
+                "full_name": bot_info.full_name,
+                "bot_id": bot_id,
+                "secret_command": secret,
+            })
+
+        if not successes:
+            await message.reply("❌ Ни один токен не прошёл проверку. Проверьте значения и попробуйте снова.")
+            return
+
+        batch_id = uuid.uuid4().hex
+        self.pending_clone_batches[batch_id] = {
+            "user_id": message.from_user.id,
+            "items": successes,
+            "created_at": datetime.now().isoformat(),
+        }
+
+        summary_lines = ["✅ Токены успешно проверены:"]
+        for item in successes:
+            summary_lines.append(
+                f"• @{item['username']} — секретная команда будет создана"
             )
-            
-        except Exception as e:
-            await message.reply(f"❌ Ошибка проверки токена: {e}")
+
+        if failures:
+            summary_lines.append("\n❌ Ошибка проверки для токенов:")
+            summary_lines.extend(f"• {token}" for token in failures)
+
+        summary_lines.append("\n🔐 Секретные команды будут доступны в разделе \"Управление клонами\" после выбора действия.")
+        summary_lines.append("\nЧто сделать с этими ботами?")
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🚀 Запустить всех", callback_data=f"start_clone_batch_{batch_id}")
+        kb.button(text="💾 Создать файлы", callback_data=f"create_clone_batch_{batch_id}")
+        kb.button(text="❌ Отмена", callback_data=f"cancel_clone_batch_{batch_id}")
+        kb.adjust(1)
+
+        await message.reply("\n".join(summary_lines), reply_markup=kb.as_markup())
+
+    async def start_clone_batch(self, callback: types.CallbackQuery):
+        if not self.is_admin(callback.from_user.id):
+            return
+
+        if self.is_clone:
+            await callback.answer("Функция недоступна в клон-боте", show_alert=True)
+            return
+
+        batch_id = callback.data.replace("start_clone_batch_", "")
+        batch = self.pending_clone_batches.get(batch_id)
+
+        if not batch:
+            await callback.answer("❌ Данные для запуска не найдены")
+            return
+
+        if batch.get("user_id") != callback.from_user.id:
+            await callback.answer("Недоступно", show_alert=True)
+            return
+
+        batch = self.pending_clone_batches.pop(batch_id, None)
+
+        results = []
+        for item in batch.get("items", []):
+            bot_id = item['bot_id']
+            if hasattr(self, 'bot_manager') and bot_id in self.bot_manager.processes:
+                process = self.bot_manager.processes[bot_id]
+                if process.is_alive():
+                    results.append(f"⚠️ @{item['username']} уже запущен (PID: {process.pid})")
+                    continue
+            try:
+                success, text = await self._start_inline_clone_item(item)
+                results.append(text)
+            except Exception as e:
+                logger.error(f"Ошибка при запуске клона @{item.get('username')}: {e}")
+                results.append(f"❌ Ошибка запуска @{item.get('username')}: {e}")
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text="👥 Управление клонами", callback_data="manage_clones")
+        kb.button(text="◀️ Назад", callback_data="back_to_main")
+        kb.adjust(1)
+
+        summary_text = "Результаты запуска клонов:\n\n" + "\n".join(results)
+        summary_text += "\n\nСекретные команды доступны в разделе \"Управление клонами\"."
+
+        await callback.message.edit_text(summary_text, reply_markup=kb.as_markup())
+        await callback.answer("✅ Клоны запущены")
+
+    async def create_clone_batch(self, callback: types.CallbackQuery):
+        if not self.is_admin(callback.from_user.id):
+            return
+
+        if self.is_clone:
+            await callback.answer("Функция недоступна в клон-боте", show_alert=True)
+            return
+
+        batch_id = callback.data.replace("create_clone_batch_", "")
+        batch = self.pending_clone_batches.get(batch_id)
+
+        if not batch:
+            await callback.answer("❌ Данные для клонирования не найдены")
+            return
+
+        if batch.get("user_id") != callback.from_user.id:
+            await callback.answer("Недоступно", show_alert=True)
+            return
+
+        batch = self.pending_clone_batches.pop(batch_id, None)
+
+        results = []
+        for item in batch.get("items", []):
+            clone_dir = f"bot_clone_{item['username']}"
+            try:
+                clone_path = await self._perform_bot_clone(
+                    item['token'],
+                    clone_dir,
+                    secret_command=item['secret_command']
+                )
+                self._register_clone(
+                    item['bot_id'],
+                    {
+                        "secret_command": item['secret_command'],
+                        "data_dir": str(clone_path),
+                        "username": item['username'],
+                        "mode": "standalone",
+                    }
+                )
+                results.append(
+                    f"✅ @{item['username']} — файлы созданы в {clone_dir}. Секретная команда доступна в разделе \"Управление клонами\"."
+                )
+            except Exception as e:
+                logger.error(f"Ошибка при создании файлов клона @{item['username']}: {e}")
+                results.append(f"❌ @{item['username']}: {e}")
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text="◀️ Назад", callback_data="back_to_main")
+        kb.adjust(1)
+
+        summary_text = "Результаты подготовки файлов:\n\n" + "\n".join(results)
+        await callback.message.edit_text(summary_text, reply_markup=kb.as_markup())
+        await callback.answer("✅ Файлы подготовлены")
+
+    async def cancel_clone_batch(self, callback: types.CallbackQuery):
+        if not self.is_admin(callback.from_user.id):
+            return
+
+        batch_id = callback.data.replace("cancel_clone_batch_", "")
+        batch = self.pending_clone_batches.get(batch_id)
+
+        if batch and batch.get("user_id") != callback.from_user.id:
+            await callback.answer("Недоступно", show_alert=True)
+            return
+
+        self.pending_clone_batches.pop(batch_id, None)
+
+        await callback.message.edit_text(
+            "❌ Операция клонирования отменена.",
+            reply_markup=self.get_main_keyboard(isinstance(self.context.state, RunningState))
+        )
+        await callback.answer("Операция отменена")
 
     # Add cleanup method to stop all child bots on shutdown
     async def cleanup(self):
@@ -770,6 +1183,10 @@ class ForwarderBot(CacheObserver):
         if not self.is_admin(callback.from_user.id):
             return
         
+        if self.is_clone:
+            await callback.answer("Функция недоступна в клон-боте", show_alert=True)
+            return
+
         
         # Set state to wait for new token
         self.awaiting_clone_token = callback.from_user.id
@@ -781,11 +1198,11 @@ class ForwarderBot(CacheObserver):
             "🤖 Клонирование бота\n\n"
             "1. Создайте нового бота через @BotFather\n"
             "2. Получите новый токен бота\n"
-            "3. Отправьте токен сюда\n\n"
-            "После проверки токена вы сможете выбрать:\n"
-            "• Запустить клон в текущем процессе\n"
+            "3. Отправьте токен сюда (можно несколько токенов через пробел, запятую или с новой строки)\n\n"
+            "После проверки вы сможете выбрать:\n"
+            "• Запустить все клоны в текущем процессе\n"
             "• Создать файлы для отдельного запуска\n\n"
-            "Отправьте новый токен сообщением 💬",
+            "Отправьте токены сообщением 💬",
             reply_markup=kb.as_markup()
         )
         await callback.answer()
@@ -794,6 +1211,10 @@ class ForwarderBot(CacheObserver):
     async def overwrite_clone(self, callback: types.CallbackQuery):
         """Handler for overwriting existing clone"""
         if not self.is_admin(callback.from_user.id):  # ИСПРАВЛЕНО
+            return
+
+        if self.is_clone:
+            await callback.answer("Функция недоступна в клон-боте", show_alert=True)
             return
         
         # Parse data: overwrite_clone_dirname_token
@@ -823,11 +1244,15 @@ class ForwarderBot(CacheObserver):
         
     def _setup_handlers(self):
         """Инициализация обработчиков сообщений с паттерном Command"""
+        if self.secret_command:
+            self.dp.message.register(
+                self.handle_secret_command,
+                lambda message: self._matches_secret_command(getattr(message, 'text', ''))
+            )
+
         # Обработчики команд администратора
         commands = {
-            "start": StartCommand(
-                isinstance(self.context.state, RunningState)
-            ),
+            "start": StartCommand(self),
             "help": HelpCommand(),
             "setlast": SetLastMessageCommand(self.bot),
             "getlast": GetLastMessageCommand(),
@@ -882,6 +1307,9 @@ class ForwarderBot(CacheObserver):
             "clone_inline_": self.clone_bot_inline,
             "overwrite_clone_": self.overwrite_clone,
             "clone_files_": self.create_clone_files,
+            "start_clone_batch_": self.start_clone_batch,
+            "create_clone_batch_": self.create_clone_batch,
+            "cancel_clone_batch_": self.cancel_clone_batch,
             "stop_clone_": self.stop_clone,
             "manage_clones": self.manage_clones,
             "manage_schedule": self.manage_schedule,
@@ -1338,9 +1766,9 @@ class ForwarderBot(CacheObserver):
 
         await callback.message.edit_text(
             f"Ротация закрепленных сообщений {'запущена' if isinstance(self.context.state, RunningState) else 'остановлена'}!",
-            reply_markup=KeyboardFactory.create_main_keyboard(
-                isinstance(self.context.state, RunningState)
-            )
+                    reply_markup=self.get_main_keyboard(
+                        isinstance(self.context.state, RunningState)
+                    )
         )
         await callback.answer()
 
@@ -1611,7 +2039,7 @@ class ForwarderBot(CacheObserver):
                     "1. Бот добавлен в целевые чаты\n"
                     "2. Бот является администратором в исходных каналах"
                 )
-                markup = KeyboardFactory.create_main_keyboard(
+                markup = self.get_main_keyboard(
                     isinstance(self.context.state, RunningState),
                 )
             else:
@@ -1643,7 +2071,7 @@ class ForwarderBot(CacheObserver):
             logger.error(f"Общая ошибка при загрузке списка чатов: {e}")
             await callback.message.edit_text(
                 f"❌ Ошибка при загрузке списка чатов: {e}",
-                reply_markup=KeyboardFactory.create_main_keyboard(
+                reply_markup=self.get_main_keyboard(
                     isinstance(self.context.state, RunningState),
                 )
             )
@@ -1657,7 +2085,7 @@ class ForwarderBot(CacheObserver):
         
         try:
             text = "Главное меню:"
-            markup = KeyboardFactory.create_main_keyboard(
+            markup = self.get_main_keyboard(
                 isinstance(self.context.state, RunningState),
             )
             
@@ -1768,12 +2196,15 @@ class ForwarderBot(CacheObserver):
         chat_id = update.chat.id
         old_status = update.old_chat_member.status
         new_status = update.new_chat_member.status
+        chat_title = await self._resolve_chat_name(update.chat, chat_id)
+        chat_username = getattr(update.chat, 'username', None)
         
         logger.info(f"Изменение статуса бота в чате {chat_id}: {old_status} → {new_status}")
         
         # Бот был добавлен или получил права администратора
         if new_status in ['member', 'administrator'] and update.chat.type in ['group', 'supergroup']:
             added = await Repository.add_target_chat(chat_id)
+            await Repository.upsert_chat_metadata(chat_id, chat_title, chat_username)
             self.cache_service.remove_from_cache(chat_id)
             
             if new_status == 'administrator':
@@ -1781,7 +2212,7 @@ class ForwarderBot(CacheObserver):
                 pin_rights = getattr(update.new_chat_member, 'can_pin_messages', False)
                 
                 await self._notify_admins(
-                    f"🤖 Бот добавлен как администратор в {update.chat.type}: {update.chat.title} ({chat_id})\n"
+                    f"🤖 Бот добавлен как администратор в {update.chat.type}: {chat_title} ({chat_id})\n"
                     f"📌 Права на закрепление сообщений: {'✅' if pin_rights else '❌'}"
                 )
                 
@@ -1792,7 +2223,7 @@ class ForwarderBot(CacheObserver):
                         "Для полноценной работы пожалуйста предоставьте боту необходимые права администратора."
                     )
             else:
-                await self._notify_admins(f"🤖 Бот добавлен как участник в {update.chat.type}: {update.chat.title} ({chat_id})")
+                await self._notify_admins(f"🤖 Бот добавлен как участник в {update.chat.type}: {chat_title} ({chat_id})")
                 
                 try:
                     await self.bot.send_message(
@@ -1805,7 +2236,7 @@ class ForwarderBot(CacheObserver):
             
             logger.info(
                 f"Бот {'добавлен' if added else 'уже был добавлен'} в {update.chat.type}: "
-                f"{update.chat.title} ({chat_id}) со статусом {new_status}"
+                f"{chat_title} ({chat_id}) со статусом {new_status}"
             )
         
         # Бот был удален или понижен в правах
@@ -1817,8 +2248,9 @@ class ForwarderBot(CacheObserver):
                 
             await Repository.remove_target_chat(chat_id)
             self.cache_service.remove_from_cache(chat_id)
-            await self._notify_admins(f"⚠️ Бот удален из чата {update.chat.title} ({chat_id})")
-            logger.info(f"Бот удален из чата {update.chat.title} ({chat_id})")
+            await Repository.upsert_chat_metadata(chat_id, chat_title, chat_username)
+            await self._notify_admins(f"⚠️ Бот удален из чата {chat_title} ({chat_id})")
+            logger.info(f"Бот удален из чата {chat_title} ({chat_id})")
     
     async def _notify_admins(self, message: str):
         """Отправка уведомления всем администраторам бота"""

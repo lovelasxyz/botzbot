@@ -125,6 +125,14 @@ class Repository:
                         added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
                     
+                    -- Метаданные целевых чатов
+                    CREATE TABLE IF NOT EXISTS chat_metadata (
+                        chat_id INTEGER PRIMARY KEY,
+                        title TEXT,
+                        username TEXT,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+
                     -- Последние сообщения из каналов
                     CREATE TABLE IF NOT EXISTS last_messages (
                         channel_id TEXT PRIMARY KEY,
@@ -168,6 +176,7 @@ class Repository:
                     CREATE INDEX IF NOT EXISTS idx_last_messages_timestamp ON last_messages(timestamp);
                     CREATE INDEX IF NOT EXISTS idx_schedule_times ON schedule(start_time, end_time);
                     CREATE INDEX IF NOT EXISTS idx_schedule_channel ON schedule(channel_id);
+                    CREATE INDEX IF NOT EXISTS idx_chat_metadata_title ON chat_metadata(title);
                 """)
                 await db.commit()
                 logger.info("✅ База данных инициализирована успешно")
@@ -291,6 +300,48 @@ class Repository:
                 logger.info(f"Удален целевой чат: {chat_id}")
         except Exception as e:
             logger.error(f"Ошибка при удалении целевого чата {chat_id}: {e}")
+
+    @staticmethod
+    async def upsert_chat_metadata(chat_id: int, title: Optional[str], username: Optional[str]) -> None:
+        """Сохраняет или обновляет метаданные чата"""
+        try:
+            async with DatabaseConnectionPool.get_connection() as db:
+                await db.execute(
+                    """
+                    INSERT INTO chat_metadata (chat_id, title, username, updated_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(chat_id)
+                    DO UPDATE SET
+                        title=excluded.title,
+                        username=excluded.username,
+                        updated_at=CURRENT_TIMESTAMP
+                    """,
+                    (chat_id, title, username)
+                )
+                await db.commit()
+                logger.debug(f"Обновлены метаданные чата {chat_id}: title={title}, username={username}")
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении метаданных чата {chat_id}: {e}")
+
+    @staticmethod
+    async def get_chat_metadata(chat_id: int) -> Optional[Dict[str, Any]]:
+        """Возвращает сохраненные метаданные чата"""
+        try:
+            async with DatabaseConnectionPool.get_connection() as db:
+                async with db.execute(
+                    "SELECT title, username, updated_at FROM chat_metadata WHERE chat_id = ?",
+                    (chat_id,)
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        return {
+                            "title": row[0],
+                            "username": row[1],
+                            "updated_at": row[2],
+                        }
+        except Exception as e:
+            logger.error(f"Ошибка при получении метаданных чата {chat_id}: {e}")
+        return None
 
     @staticmethod
     async def get_config(key: str, default: Optional[str] = None) -> Optional[str]:
